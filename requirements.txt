@@ -1,6 +1,10 @@
-fastapi==0.118.0
-uvicorn==0.37.0
-python-dotenv==1.1.1
-PyGithub==2.8.1
-openai==1.109.1
-httpx==0.28.1
+fastapi
+uvicorn[standard]
+PyGithub
+requests
+openai
+python-dotenv
+pydantic
+retry
+pandas
+pillow
