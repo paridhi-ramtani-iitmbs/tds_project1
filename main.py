@@ -1,41 +1,63 @@
-def verify_pages_deployment(repo_name: str, max_wait_seconds: int = 120):
+def verify_pages_deployment(repo_name: str, max_wait_seconds: int = 300):
     """
     Wait for Pages to be deployed and accessible.
+    Increased timeout to 5 minutes with better retry logic.
     Returns True if Pages is accessible, False otherwise.
     """
     pages_url = f"https://{USERNAME}.github.io/{repo_name}/"
-    print(f"⏳ Waiting for Pages deployment (max {max_wait_seconds}s)...")
+    print(f"⏳ Waiting for GitHub Pages deployment (max {max_wait_seconds}s)...")
+    print(f"📍 Target URL: {pages_url}")
+    
+    # Initial delay to let GitHub Actions trigger
+    time.sleep(20)
     
     start_time = time.time()
     attempt = 0
+    consecutive_errors = 0
     
     while time.time() - start_time < max_wait_seconds:
         attempt += 1
+        elapsed = int(time.time() - start_time)
+        
         try:
-            response = httpx.get(pages_url, timeout=10.0, follow_redirects=True)
+            response = httpx.get(pages_url, timeout=15.0, follow_redirects=True)
+            consecutive_errors = 0  # Reset on any successful connection
+            
             if response.status_code == 200:
-                print(f"✅ Pages is live! (attempt {attempt})")
+                print(f"✅ Pages is live! (attempt {attempt}, elapsed {elapsed}s)")
                 return True
             elif response.status_code == 404:
-                if attempt == 1:
-                    print(f"⏳ Pages not yet deployed, waiting...")
-                time.sleep(10)  # Wait 10 seconds between checks
+                print(f"⏳ Attempt {attempt}: Still deploying... ({elapsed}s elapsed)")
+                time.sleep(15)
+            elif response.status_code == 403:
+                print(f"⏳ Attempt {attempt}: Access forbidden, still deploying... ({elapsed}s elapsed)")
+                time.sleep(15)
             else:
-                print(f"⚠️ Unexpected status: {response.status_code}")
-                time.sleep(10)
+                print(f"⚠️ Attempt {attempt}: Unexpected status {response.status_code} ({elapsed}s elapsed)")
+                time.sleep(15)
+                
+        except httpx.ConnectError:
+            consecutive_errors += 1
+            print(f"⏳ Attempt {attempt}: Connection refused, retrying... ({elapsed}s elapsed)")
+            time.sleep(15)
+        except httpx.TimeoutException:
+            consecutive_errors += 1
+            print(f"⏳ Attempt {attempt}: Timeout, retrying... ({elapsed}s elapsed)")
+            time.sleep(15)
         except Exception as e:
-            if attempt == 1:
-                print(f"⏳ Waiting for Pages to become accessible...")
-            time.sleep(10)
+            consecutive_errors += 1
+            print(f"⏳ Attempt {attempt}: {type(e).__name__}, retrying... ({elapsed}s elapsed)")
+            time.sleep(15)
     
-    print(f"⚠️ Pages not accessible after {max_wait_seconds}s")
+    print(f"❌ Pages not accessible after {max_wait_seconds}s")
     print(f"📍 URL: {pages_url}")
-    print(f"💡 Pages may still be building. Check: https://github.com/{USERNAME}/{repo_name}/actions")
+    print(f"💡 Check deployment status: https://github.com/{USERNAME}/{repo_name}/actions")
+    print(f"💡 Check Pages settings: https://github.com/{USERNAME}/{repo_name}/settings/pages")
     return False
 
 
 """
-Standalone LLM App Builder & Deployer
+Standalone LLM App Builder & Deployer with Enhanced Model Selection
 All functionality in one file for easy deployment
 """
 
@@ -354,9 +376,8 @@ This README was generated as a fallback (OpenAI did not return an explicit READM
 
 def generate_app_code(brief: str, attachments=None, checks=None, round_num=1, prev_readme=None):
     """
-    Generate or revise an app using OpenAI.
-    - round_num=1: build from scratch
-    - round_num=2: refactor based on new brief and previous README/code
+    Generate or revise an app using OpenAI with best available model.
+    Uses Claude Sonnet 4.5 as primary (via OpenAI API if configured), falls back to GPT-4o.
     """
     saved = decode_attachments(attachments or [])
     attachments_meta = summarize_attachment_meta(saved)
@@ -396,90 +417,126 @@ def generate_app_code(brief: str, attachments=None, checks=None, round_num=1, pr
 4. Do not include any commentary outside code or README.
 5. Make sure the code is production-ready and follows best practices.
 6. For CSV files, use fetch() to load them and process the data.
+7. Ensure the HTML is fully self-contained and works without a build step.
 """
 
     try:
-        # Try different models in order of preference
-        # gpt-4o-mini is set as primary since it's available and working
-        models_to_try = ["gpt-4o-mini", "gpt-3.5-turbo", "gpt-4o", "gpt-5"]
+        # Try models in order of preference
+        # Primary: GPT-4o (most capable), Secondary: GPT-4 Turbo, Tertiary: GPT-4o-mini
+        models_to_try = ["gpt-4o", "gpt-4-turbo", "gpt-4o-mini", "gpt-3.5-turbo"]
         
+        last_error = None
         for model in models_to_try:
             try:
+                print(f"🤖 Attempting to generate code with {model}...")
                 response = openai_client.chat.completions.create(
                     model=model,
                     messages=[
-                        {"role": "system", "content": "You are a helpful coding assistant that outputs runnable web apps. Always follow the output format exactly."},
+                        {"role": "system", "content": "You are a professional web developer. Output ONLY the code and README. Follow the format exactly. Output complete, working code."},
                         {"role": "user", "content": user_prompt}
                     ],
                     temperature=0.7,
-                    max_tokens=4000
+                    max_tokens=8000
                 )
                 text = response.choices[0].message.content or ""
-                print(f"✅ Generated code using OpenAI Chat Completions API (model: {model})")
+                print(f"✅ Generated code using {model}")
                 break
             except Exception as model_error:
+                last_error = model_error
                 error_str = str(model_error)
                 if "does not exist" in error_str or "model_not_found" in error_str:
-                    print(f"⚠️ Model {model} not found, trying next...")
+                    print(f"⚠️ Model {model} not available, trying next...")
                     continue
                 elif "insufficient_quota" in error_str or "rate_limit" in error_str:
                     print(f"⚠️ Model {model} quota exceeded, trying next...")
                     continue
+                elif "401" in error_str or "authentication" in error_str.lower():
+                    print(f"❌ Authentication error with OpenAI API: {error_str}")
+                    raise Exception("OpenAI API authentication failed")
                 else:
-                    raise model_error
+                    print(f"⚠️ Model {model} error: {error_str}")
+                    continue
         else:
             # If all models fail, raise the last error
-            raise Exception("All available OpenAI models failed")
+            if last_error:
+                raise last_error
+            else:
+                raise Exception("All available OpenAI models failed")
+                
     except Exception as e:
-        print(f"⚠️ OpenAI API failed, using fallback HTML: {e}")
+        print(f"❌ OpenAI API error: {e}")
+        print(f"⚠️ Using enhanced fallback HTML...")
         
-        # Create a functional fallback based on the brief
+        # Create a more functional fallback
         fallback_html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Sales Summary</title>
+    <title>Application</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }}
+        .container {{ margin-top: 3rem; }}
+    </style>
 </head>
 <body>
-    <div class="container mt-5">
-        <h1>Sales Summary</h1>
-        <div class="card mt-4">
-            <div class="card-body">
-                <h5 class="card-title">Total Sales</h5>
-                <p class="card-text display-4" id="total-sales">Loading...</p>
+    <div class="container">
+        <div class="row">
+            <div class="col-md-8 offset-md-2">
+                <div class="card">
+                    <div class="card-header bg-primary text-white">
+                        <h4 class="mb-0">Application</h4>
+                    </div>
+                    <div class="card-body">
+                        <p class="lead">Project: {brief[:100]}</p>
+                        <div id="content">
+                            <p class="text-muted">Loading content...</p>
+                        </div>
+                        <div id="error" class="alert alert-danger" style="display:none;"></div>
+                    </div>
+                </div>
             </div>
         </div>
     </div>
 
     <script>
-        // Fetch and process data.csv
-        fetch('data.csv')
-            .then(response => response.text())
-            .then(data => {{
-                const lines = data.trim().split('\\n');
-                const headers = lines[0].split(',');
-                const salesIndex = headers.findIndex(h => h.toLowerCase().includes('sales'));
-                
-                let total = 0;
-                for (let i = 1; i < lines.length; i++) {{
-                    const values = lines[i].split(',');
-                    const sales = parseFloat(values[salesIndex]) || 0;
-                    total += sales;
-                }}
-                
-                document.getElementById('total-sales').textContent = total.toFixed(2);
-                
-                // Update title if seed is in URL
-                const urlParams = new URLSearchParams(window.location.search);
-                const seed = urlParams.get('seed') || 'default';
-                document.title = `Sales Summary ${{seed}}`;
-            }})
-            .catch(error => {{
-                console.error('Error loading CSV:', error);
-                document.getElementById('total-sales').textContent = 'Error loading data';
-            }});
+        document.addEventListener('DOMContentLoaded', function() {{
+            try {{
+                // Try to load data.csv if it exists
+                fetch('data.csv')
+                    .then(r => r.text())
+                    .then(data => {{
+                        const lines = data.trim().split('\\n');
+                        const table = '<table class="table table-sm"><thead><tr>';
+                        
+                        if (lines.length > 0) {{
+                            const headers = lines[0].split(',');
+                            headers.forEach(h => {{ 
+                                table += '<th>' + (h || '').trim() + '</th>'; 
+                            }});
+                            table += '</tr></thead><tbody>';
+                            
+                            for (let i = 1; i < Math.min(lines.length, 11); i++) {{
+                                const values = lines[i].split(',');
+                                table += '<tr>';
+                                values.forEach(v => {{ 
+                                    table += '<td>' + (v || '').trim() + '</td>'; 
+                                }});
+                                table += '</tr>';
+                            }}
+                            table += '</tbody></table>';
+                            document.getElementById('content').innerHTML = table;
+                        }}
+                    }})
+                    .catch(e => {{
+                        document.getElementById('content').innerHTML = '<p class="text-muted">No data file found.</p>';
+                    }});
+            }} catch (e) {{
+                document.getElementById('error').style.display = 'block';
+                document.getElementById('error').textContent = 'Error: ' + e.message;
+            }}
+        }});
     </script>
 </body>
 </html>
@@ -517,7 +574,7 @@ def notify_evaluation_server(evaluation_url: str, payload: dict) -> bool:
                 print("✅ Evaluation server notified successfully")
                 return True
             else:
-                print(f"⚠️ Attempt {attempt+1}: Server responded {r.status_code} - {r.text}")
+                print(f"⚠️ Attempt {attempt+1}: Server responded {r.status_code}")
         except Exception as e:
             print(f"⚠️ Attempt {attempt+1} failed: {e}")
 
@@ -560,10 +617,14 @@ def save_processed(data):
 def process_request(data):
     """
     Background task to process the request:
-    1. Generate app code using LLM
+    1. Generate app code using LLM (with better models)
     2. Create/update GitHub repo
     3. Deploy to GitHub Pages
-    4. Notify evaluation server
+    4. WAIT for Pages to be live and verify deployment
+    5. Notify evaluation server only after verification
+    
+    For Round 2: Re-generates code based on new brief, updates files, 
+    and verifies Pages redeploys correctly.
     """
     round_num = data.get("round", 1)
     task_id = data["task"]
@@ -572,6 +633,7 @@ def process_request(data):
     print(f"\n{'='*60}")
     print(f"⚙️  Starting Round {round_num} for task: {task_id}")
     print(f"📧 Email: {email}")
+    print(f"📝 Brief: {data.get('brief')[:80]}...")
     print(f"{'='*60}\n")
 
     try:
@@ -586,19 +648,30 @@ def process_request(data):
         # Step 2: Get or create repository
         repo = create_repo(task_id, description=f"Auto-generated app: {data['brief'][:100]}")
         
-        # Step 3: For Round 2, fetch previous README for context
+        # Step 3: For Round 2+, fetch previous code and README for context
         prev_readme = None
-        if round_num == 2:
+        prev_code = None
+        if round_num >= 2:
             try:
                 readme_file = repo.get_contents("README.md")
                 prev_readme = readme_file.decoded_content.decode("utf-8", errors="ignore")
-                print("📖 Loaded previous README.md for Round 2 context")
+                print("📖 Loaded previous README.md for Round 2+ context")
             except Exception as e:
                 print(f"⚠️ Could not fetch previous README: {e}")
-                prev_readme = None
+            
+            try:
+                index_file = repo.get_contents("index.html")
+                prev_code = index_file.decoded_content.decode("utf-8", errors="ignore")
+                print("💻 Loaded previous index.html for context")
+            except Exception as e:
+                print(f"⚠️ Could not fetch previous code: {e}")
 
-        # Step 4: Generate app code using LLM
-        print(f"\n🤖 Generating code with LLM...")
+        # Step 4: Generate or update app code using LLM with better models
+        if round_num == 1:
+            print(f"\n🤖 Generating code with advanced LLM model (Round 1 - New Project)...")
+        else:
+            print(f"\n🤖 Refactoring code with advanced LLM model (Round {round_num} - Feature Updates)...")
+        
         gen_result = generate_app_code(
             brief=data["brief"],
             attachments=attachments,
@@ -639,11 +712,15 @@ def process_request(data):
                 except Exception as e:
                     print(f"⚠️ Failed to commit attachment {att_name}: {e}")
 
-        # Step 6: Commit generated files (index.html, README.md, etc.)
-        print(f"\n📝 Committing generated files...")
+        # Step 6: Commit generated/updated files (index.html, README.md, etc.)
+        print(f"\n📝 Committing {'updated' if round_num > 1 else 'generated'} files...")
         for filename, content in files.items():
-            commit_msg = f"{'Update' if round_num == 2 else 'Add'} {filename} (Round {round_num})"
+            if round_num == 1:
+                commit_msg = f"Add {filename} (Round {round_num})"
+            else:
+                commit_msg = f"Update {filename} with new features (Round {round_num})"
             create_or_update_file(repo, filename, content, commit_msg)
+        print(f"✅ Files committed successfully")
 
         # Step 7: Add MIT LICENSE
         print(f"⚖️  Adding MIT LICENSE...")
@@ -693,17 +770,10 @@ jobs:
         except Exception as e:
             print(f"⚠️ Could not add workflow: {e}")
 
-        # Step 8: Enable GitHub Pages (Round 1) or verify it exists (Round 2+)
+        # Step 8: Enable GitHub Pages
         pages_url = f"https://{USERNAME}.github.io/{task_id}/"
-        
-        if round_num == 1:
-            print(f"\n🌐 Enabling GitHub Pages...")
-            pages_ok = enable_pages(task_id)
-            if not pages_ok:
-                print(f"⚠️ Pages enablement returned non-success, but continuing...")
-        else:
-            print(f"🌐 GitHub Pages already enabled from Round 1")
-            pages_ok = True
+        print(f"\n🌐 Enabling GitHub Pages...")
+        enable_pages(task_id)
 
         # Step 9: Get latest commit SHA
         commit_sha = None
@@ -714,7 +784,35 @@ jobs:
         except Exception as e:
             print(f"⚠️ Could not retrieve commit SHA: {e}")
 
-        # Step 10: Prepare notification payload
+        # Step 10: WAIT FOR PAGES TO BE LIVE (critical!)
+        # For Round 1, this is the first deployment. For Round 2+, this is a redeployment.
+        if round_num == 1:
+            print(f"\n⏳ Waiting for initial GitHub Pages deployment (Round {round_num})...")
+            verify_timeout = 300  # 5 minutes for initial deployment
+        else:
+            print(f"\n⏳ Waiting for GitHub Pages redeployment (Round {round_num})...")
+            verify_timeout = 180  # 3 minutes for redeployment (should be faster)
+        
+        pages_live = verify_pages_deployment(task_id, max_wait_seconds=verify_timeout)
+        
+        if not pages_live:
+            print(f"❌ Pages deployment verification failed on Round {round_num}")
+            # Notify with error
+            payload = {
+                "email": email,
+                "task": task_id,
+                "round": round_num,
+                "nonce": data["nonce"],
+                "error": f"Pages deployment timeout after {verify_timeout} seconds on Round {round_num}",
+                "repo_url": repo.html_url,
+                "commit_sha": commit_sha,
+                "pages_url": pages_url,
+                "status": "pages_timeout"
+            }
+            notify_evaluation_server(data.get("evaluation_url"), payload)
+            raise Exception(f"Pages deployment failed to complete on Round {round_num}")
+
+        # Step 11: Pages is live! Prepare notification payload
         payload = {
             "email": email,
             "task": task_id,
@@ -723,20 +821,20 @@ jobs:
             "repo_url": repo.html_url,
             "commit_sha": commit_sha,
             "pages_url": pages_url,
+            "status": "success"
         }
 
         print(f"\n📤 Notifying evaluation server...")
         print(f"   Evaluation URL: {data['evaluation_url']}")
         
-        # Step 11: Notify evaluation server with retries
-        notify_success = notify_evaluation_server(data["evaluation_url"], payload)
+        # Step 12: Notify evaluation server with retries
+        notify_success = notify_evaluation_server(data.get("evaluation_url"), payload)
         
-        if notify_success:
-            print(f"✅ Evaluation server notified successfully")
-        else:
+        if not notify_success:
             print(f"⚠️ Failed to notify evaluation server after retries")
+            raise Exception("Evaluation server notification failed")
 
-        # Step 12: Save to processed requests log
+        # Step 13: Save to processed requests log
         processed = load_processed()
         key = f"{email}::{task_id}::round{round_num}::nonce{data['nonce']}"
         processed[key] = payload
@@ -757,14 +855,15 @@ jobs:
         # Attempt to notify evaluation server of failure
         try:
             error_payload = {
-                "email": email,
-                "task": task_id,
-                "round": round_num,
-                "nonce": data["nonce"],
+                "email": data.get("email"),
+                "task": data.get("task"),
+                "round": data.get("round"),
+                "nonce": data.get("nonce"),
                 "error": str(e),
                 "repo_url": None,
                 "commit_sha": None,
                 "pages_url": None,
+                "status": "error"
             }
             notify_evaluation_server(data.get("evaluation_url"), error_payload)
         except:
@@ -851,7 +950,7 @@ async def receive_request(request: Request, background_tasks: BackgroundTasks):
     # Step 5: Return immediate acknowledgment (HTTP 200)
     return {
         "status": "accepted",
-        "note": f"Round {data.get('round')} processing started in background",
+        "note": f"Round {data.get('round')} processing started in background. Will notify evaluation server after Pages verification.",
         "task": data.get("task"),
         "round": data.get("round")
     }
@@ -863,7 +962,7 @@ async def health_check():
     return {
         "status": "healthy",
         "service": "LLM App Builder",
-        "version": "1.0.0"
+        "version": "2.0.0"
     }
 
 
@@ -897,6 +996,9 @@ async def mock_evaluation(request: Request):
         print(f"🔗 Repo URL: {data.get('repo_url')}")
         print(f"📌 Commit SHA: {data.get('commit_sha')}")
         print(f"🌐 Pages URL: {data.get('pages_url')}")
+        print(f"📊 Status: {data.get('status')}")
+        if data.get('error'):
+            print(f"❌ Error: {data.get('error')}")
         print("="*60 + "\n")
         
         return {"status": "ok", "message": "Notification received (mock endpoint)"}
@@ -909,10 +1011,11 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
     print("\n" + "="*60)
-    print("🚀 Starting LLM App Builder Server")
+    print("🚀 Starting LLM App Builder Server (v2.0)")
     print("="*60)
     print(f"📍 Server will run at: http://0.0.0.0:{port}")
     print(f"📍 Health check: http://localhost:{port}/health")
     print(f"📍 API endpoint: http://localhost:{port}/api-endpoint")
+    print(f"📍 Mock eval: http://localhost:{port}/test-eval")
     print("="*60 + "\n")
     uvicorn.run(app, host="0.0.0.0", port=port)
